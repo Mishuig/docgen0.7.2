@@ -1,0 +1,7 @@
+- setup-dotnet 9.0.x
+- restore -r win-x64
+- publish:
+    -c Release -r win-x64 --self-contained true
+    -p:PublishSingleFile=false
+    -p:PublishReadyToRun=false
+- upload artifact Docugen-0.7.3-portable-win-x64
