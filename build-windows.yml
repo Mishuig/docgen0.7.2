@@ -1,0 +1,215 @@
+name: Build portable Windows app
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+    paths:
+      - '**.cs'
+      - '**.xaml'
+      - '**.csproj'
+      - '**.ps1'
+      - '**.cmd'
+      - '**.png'
+      - '**.ico'
+      - 'samples/**'
+      - '.github/workflows/build-windows.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Portable win-x64 (net9, folder)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: SDK info
+        shell: pwsh
+        run: |
+          dotnet --list-sdks
+          dotnet --info
+
+      - name: Cache NuGet
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-net9-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-net9-
+            nuget-${{ runner.os }}-
+
+      - name: Read version from csproj
+        id: ver
+        shell: pwsh
+        run: |
+          $xml = [xml](Get-Content .\DocumentGenerator.csproj -Raw)
+          $version = @($xml.Project.PropertyGroup.Version | Where-Object { $_ }) | Select-Object -First 1
+          if (-not $version) { throw 'Version not found in DocumentGenerator.csproj' }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Version: $version"
+
+      - name: Restore (win-x64)
+        run: dotnet restore .\DocumentGenerator.csproj --runtime win-x64
+
+      - name: Publish self-contained folder
+        id: publish
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '${{ steps.ver.outputs.version }}'
+          $name    = "Docugen-$version-portable-win-x64"
+          $package = Join-Path $env:GITHUB_WORKSPACE "publish\$name"
+
+          if (Test-Path $package) { Remove-Item $package -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $package | Out-Null
+
+          # Stable portable layout for WPF + SQLite:
+          #  - self-contained  → no .NET install on target PC
+          #  - NOT single-file → no TEMP extraction (that often fails silently)
+          #  - ReadyToRun off  → avoids NETSDK1094 on mixed SDK runners
+          Write-Host "=== dotnet publish ==="
+          dotnet publish .\DocumentGenerator.csproj `
+            --configuration Release `
+            --runtime win-x64 `
+            --self-contained true `
+            --no-restore `
+            -p:PublishSingleFile=false `
+            -p:DebugType=None `
+            -p:DebugSymbols=false `
+            -p:PublishReadyToRun=false `
+            --output $package
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "dotnet publish failed with exit code $LASTEXITCODE"
+          }
+
+          # --- validation ---
+          $exe = Join-Path $package 'DocumentGenerator.exe'
+          if (-not (Test-Path $exe)) {
+            throw 'DocumentGenerator.exe was not produced.'
+          }
+
+          $exeMb = [math]::Round((Get-Item $exe).Length / 1MB, 2)
+          Write-Host "DocumentGenerator.exe: $exeMb MB"
+
+          $mz = [System.IO.File]::ReadAllBytes($exe)[0..1]
+          if ($mz[0] -ne 0x4D -or $mz[1] -ne 0x5A) {
+            throw 'DocumentGenerator.exe is not a valid PE file (missing MZ header).'
+          }
+          Write-Host 'PE header: OK'
+
+          $must = @('DocumentGenerator.exe', 'DocumentGenerator.dll')
+          foreach ($f in $must) {
+            if (-not (Test-Path (Join-Path $package $f))) {
+              throw "Required file missing: $f"
+            }
+          }
+
+          $sqlite = Get-ChildItem $package -Filter 'e_sqlite3.dll' -Recurse -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+          if (-not $sqlite) {
+            throw 'e_sqlite3.dll not found — SQLite native library missing from publish output.'
+          }
+          Write-Host "e_sqlite3.dll: $($sqlite.Name) ($([math]::Round($sqlite.Length/1KB,1)) KB)"
+
+          $hostDll = @('hostfxr.dll', 'hostpolicy.dll', 'coreclr.dll') |
+                     Where-Object { Test-Path (Join-Path $package $_) }
+          if ($hostDll.Count -lt 1) {
+            Write-Warning 'Runtime host DLLs not found at package root (may be nested). Check file list.'
+          } else {
+            Write-Host "Host DLLs: $($hostDll -join ', ')"
+          }
+
+          Write-Host ''
+          Write-Host '=== Top-level package contents ==='
+          Get-ChildItem $package | Sort-Object Name | ForEach-Object {
+            $sz = if ($_.PSIsContainer) { '<DIR>' } else { '{0:N0} B' -f $_.Length }
+            Write-Host ('  {0,-55} {1,14}' -f $_.Name, $sz)
+          }
+
+          $files   = @(Get-ChildItem $package -File -Recurse)
+          $totalMb = [math]::Round(($files | Measure-Object Length -Sum).Sum / 1MB, 1)
+          Write-Host "Total: $($files.Count) files, $totalMb MB"
+
+          if ($files.Count -lt 20) {
+            throw "Package looks incomplete ($($files.Count) files). Expected a full self-contained folder."
+          }
+          if ($totalMb -lt 30) {
+            throw "Package suspiciously small ($totalMb MB). Self-contained WPF usually is much larger."
+          }
+
+          # --- extras ---
+          if (Test-Path .\README.md)           { Copy-Item .\README.md (Join-Path $package 'README.txt') -Force }
+          if (Test-Path .\App.ico)             { Copy-Item .\App.ico $package -Force }
+          if (Test-Path .\create-shortcut.ps1) { Copy-Item .\create-shortcut.ps1 $package -Force }
+          if (Test-Path .\Create-Shortcut.cmd) { Copy-Item .\Create-Shortcut.cmd $package -Force }
+          if (Test-Path .\Start-Docugen.cmd)   { Copy-Item .\Start-Docugen.cmd $package -Force }
+          if (Test-Path .\samples) {
+            Copy-Item .\samples (Join-Path $package 'samples') -Recurse -Force
+          }
+
+          # --- zip ---
+          $zip = Join-Path $env:GITHUB_WORKSPACE "publish\$name.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path (Join-Path $package '*') -DestinationPath $zip -Force
+
+          $zipMb = [math]::Round((Get-Item $zip).Length / 1MB, 1)
+          Write-Host "ZIP: $zip ($zipMb MB)"
+
+          "ZIP_PATH=$zip"   | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "ZIP_NAME=$name"  | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "FILE_COUNT=$($files.Count)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TOTAL_MB=$totalMb" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Summary
+        shell: pwsh
+        run: |
+          @"
+          ## Portable build ready
+
+          | Item | Value |
+          |------|-------|
+          | Version | `${{ steps.ver.outputs.version }}` |
+          | Artifact | `${{ env.ZIP_NAME }}` |
+          | Files | `${{ env.FILE_COUNT }}` |
+          | Size | `${{ env.TOTAL_MB }}` MB |
+
+          **How to run**
+          1. Download the artifact and unzip the **whole** folder.
+          2. Prefer ``Start-Docugen.cmd`` (unblocks files, writes launcher log).
+          3. Or run ``DocumentGenerator.exe`` from that folder.
+          4. Do **not** put it under ``Program Files`` (needs write access beside the EXE).
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_PATH }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: GitHub Release (tags v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" "$env:ZIP_PATH" `
+            --title "Docugen ${{ steps.ver.outputs.version }}" `
+            --generate-notes `
+            --clobber
